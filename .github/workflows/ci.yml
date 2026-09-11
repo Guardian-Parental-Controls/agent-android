@@ -8,9 +8,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: Guardian-Parental-Controls/agent-common
+          ref: v1.0.0
+          path: _agent-common
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate UniFFI Kotlin bindings
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path _agent-common/Cargo.toml
+          cargo run --manifest-path _agent-common/Cargo.toml --bin uniffi-bindgen -- \
+            generate --language kotlin --library --no-format \
+            --out-dir app/src/main/java \
+            _agent-common/target/debug/libguardian_agent.so
       - name: Unit tests
         run: ./gradlew test --no-daemon
