@@ -1,25 +1,49 @@
 #!/usr/bin/env bash
-# Emit the URL-safe base64 SHA-256 signing-certificate checksum for an APK.
-# Matches ApkSignatureVerifier / Android MDM provisioning format.
+# Emit URL-safe base64 SHA-256 of the APK signing certificate (Android MDM format).
 set -euo pipefail
 
-apk="${1:?APK path}"
-apksigner="${2:-apksigner}"
+APK="${1:?apk path required}"
+BUILD_TOOLS="${ANDROID_HOME}/build-tools"
+APKSIGNER="$(find "$BUILD_TOOLS" -maxdepth 2 -name apksigner -type f 2>/dev/null | sort -V | tail -n1)"
+[[ -n "$APKSIGNER" ]] || {
+    echo "error: apksigner not found under ANDROID_HOME=$ANDROID_HOME" >&2
+    exit 1
+}
 
-digest="$("$apksigner" verify --print-certs "$apk" 2>/dev/null | awk -F': ' '/SHA-256 digest:/ {print $2; exit}')"
-if [[ -z "$digest" ]]; then
-  echo "Could not read APK signing certificate digest from $apk" >&2
-  exit 1
-fi
+DIGEST="$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n1)"
+[[ -n "$DIGEST" ]] || {
+    echo "error: could not read signing certificate digest from $APK" >&2
+    exit 1
+}
 
-python3 - "$digest" <<'PY'
+python3 - "$DIGEST" <<'PY'
 import base64
 import sys
 
-hex_digest = sys.argv[1].replace(":", "").lower()
-if len(hex_digest) != 64:
-    raise SystemExit(f"unexpected SHA-256 digest length: {hex_digest}")
+hex_digest = sys.argv[1].lower().replace(":", "").strip()
 raw = bytes.fromhex(hex_digest)
-encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-print(encoded)
+alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+out = []
+i = 0
+while i < len(raw):
+    b0 = raw[i]
+    i += 1
+    if i < len(raw):
+        b1 = raw[i]
+        i += 1
+        if i < len(raw):
+            b2 = raw[i]
+            i += 1
+            out.append(alphabet[b0 >> 2])
+            out.append(alphabet[((b0 & 3) << 4) | (b1 >> 4)])
+            out.append(alphabet[((b1 & 15) << 2) | (b2 >> 6)])
+            out.append(alphabet[b2 & 63])
+        else:
+            out.append(alphabet[b0 >> 2])
+            out.append(alphabet[((b0 & 3) << 4) | (b1 >> 4)])
+            out.append(alphabet[(b1 & 15) << 2])
+    else:
+        out.append(alphabet[b0 >> 2])
+        out.append(alphabet[(b0 & 3) << 4])
+print("".join(out))
 PY
