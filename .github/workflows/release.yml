@@ -84,6 +84,13 @@ jobs:
           workspaces: "_agent-common -> target"
           shared-key: android-${{ matrix.target_rust }}
 
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@main
 
@@ -94,6 +101,9 @@ jobs:
 
       - name: Build Android Rust target
         working-directory: _agent-common
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: cargo ndk --target ${{ matrix.target_ndk }} build --lib --release
 
       - name: Upload compiled library
