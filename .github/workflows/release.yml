@@ -92,9 +92,46 @@ jobs:
       - name: Package release APK
         env:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          GUARDIAN_AGENT_VERSION: ${{ needs.resolve.outputs.tag }}
         run: |
-          chmod +x scripts/package-release.sh scripts/android-signature-checksum.sh
-          scripts/package-release.sh "${{ needs.resolve.outputs.tag }}" dist
+          set -euo pipefail
+          ./gradlew assembleRelease --no-daemon
+          APK_SRC="app/build/outputs/apk/release/app-release.apk"
+          TAG="${{ needs.resolve.outputs.tag }}"
+          mkdir -p dist
+          APK_NAME="guardian-android-agent-${TAG}.apk"
+          cp "$APK_SRC" "dist/${APK_NAME}"
+          APKSIGNER="$(find "${ANDROID_HOME}/build-tools" -maxdepth 2 -name apksigner -type f | sort -V | tail -n1)"
+          DIGEST="$("$APKSIGNER" verify --print-certs "dist/${APK_NAME}" 2>/dev/null | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n1)"
+          python3 - "$DIGEST" > "dist/guardian-android-agent-${TAG}.signature-checksum" <<'PY'
+          import sys
+          hex_digest = sys.argv[1].lower().replace(":", "").strip()
+          raw = bytes.fromhex(hex_digest)
+          alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+          out = []
+          i = 0
+          while i < len(raw):
+              b0 = raw[i]
+              i += 1
+              if i < len(raw):
+                  b1 = raw[i]
+                  i += 1
+                  if i < len(raw):
+                      b2 = raw[i]
+                      i += 1
+                      out.append(alphabet[b0 >> 2])
+                      out.append(alphabet[((b0 & 3) << 4) | (b1 >> 4)])
+                      out.append(alphabet[((b1 & 15) << 2) | (b2 >> 6)])
+                      out.append(alphabet[b2 & 63])
+                  else:
+                      out.append(alphabet[b0 >> 2])
+                      out.append(alphabet[((b0 & 3) << 4) | (b1 >> 4)])
+                      out.append(alphabet[(b1 & 15) << 2])
+              else:
+                  out.append(alphabet[b0 >> 2])
+                  out.append(alphabet[(b0 & 3) << 4])
+          print("".join(out))
+          PY
 
       - uses: actions/upload-artifact@v4
         with:
