@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out agent-android
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Check out agent-common
+        uses: actions/checkout@v5
+        with:
+          repository: Guardian-Parental-Controls/agent-common
+          ref: ${{ env.RELEASE_TAG }}
+          path: _agent-common
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platforms;android-35 build-tools;35.0.0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate UniFFI Kotlin bindings
+        working-directory: _agent-common
+        run: |
+          set -euo pipefail
+          cargo build
+          cargo run --bin uniffi-bindgen -- \
+            generate --language kotlin --library --no-format \
+            --out-dir ../app/src/main/java \
+            target/debug/libguardian_agent.so
+
+      - name: Require release signing secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing required secret: $name" >&2
+              exit 1
+            fi
+          done
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > release.keystore
+
+      - name: Build release APK
+        env:
+          GUARDIAN_AGENT_VERSION: ${{ env.RELEASE_TAG }}
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/release.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Stage release artifacts
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          apk="dist/guardian-android-agent-${RELEASE_TAG}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$apk"
+          apksigner="$(find "${ANDROID_HOME}/build-tools" -name apksigner -type f | sort -V | tail -n 1)"
+          chmod +x scripts/android-signature-checksum.sh
+          scripts/android-signature-checksum.sh "$apk" "$apksigner" \
+            > "dist/guardian-android-agent-${RELEASE_TAG}.signature-checksum"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: android-release
+          path: dist
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          files: dist/*
+          fail_on_unmatched_files: true
+
+      - name: Create versions automation token
+        if: secrets.GUARDIAN_VERSIONS_APP_ID != ''
+        id: versions-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GUARDIAN_VERSIONS_APP_ID }}
+          private-key: ${{ secrets.GUARDIAN_VERSIONS_PRIVATE_KEY }}
+          owner: Guardian-Parental-Controls
+          repositories: versions
+
+      - name: Publish agent-android version
+        if: steps.versions-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.versions-token.outputs.token }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          base="https://github.com/Guardian-Parental-Controls/agent-android/releases/download/${RELEASE_TAG}"
+          gh api "repos/Guardian-Parental-Controls/versions/dispatches" \
+            --method POST \
+            --input - <<EOF
+          {
+            "event_type": "component-release",
+            "client_payload": {
+              "component": "agent-android",
+              "version": "${version}",
+              "repository": "https://github.com/Guardian-Parental-Controls/agent-android",
+              "minimum_supported_version": "1.0.0",
+              "min_server": "1.0.0",
+              "protocol_version": 1,
+              "artifacts": [
+                {
+                  "id": "android-apk",
+                  "url": "${base}/guardian-android-agent-${RELEASE_TAG}.apk"
+                }
+              ]
+            }
+          }
+          EOF
