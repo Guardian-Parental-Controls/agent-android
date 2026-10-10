@@ -1,0 +1,300 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to build and publish (for example v1.0.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$REF_NAME"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag must look like vX.Y.Z, got: ${tag}" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  android-rust-build:
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_rust: aarch64-linux-android
+            target_ndk: aarch64-linux-android
+            jni_dir: arm64-v8a
+          - target_rust: armv7-linux-androideabi
+            target_ndk: armv7-linux-androideabi
+            jni_dir: armeabi-v7a
+          - target_rust: x86_64-linux-android
+            target_ndk: x86_64
+            jni_dir: x86_64
+    steps:
+      - name: Check out agent-android
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - name: Check out agent-common
+        uses: actions/checkout@v5
+        with:
+          repository: Guardian-Parental-Controls/agent-common
+          ref: v1.0.0
+          path: _agent-common
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target_rust }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "_agent-common -> target"
+          shared-key: android-${{ matrix.target_rust }}
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install cargo-ndk
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo binstall -y --force cargo-ndk
+
+      - name: Build Android Rust target
+        working-directory: _agent-common
+        run: cargo ndk --target ${{ matrix.target_ndk }} build --lib --release
+
+      - name: Upload compiled library
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-lib-${{ matrix.jni_dir }}
+          path: _agent-common/target/${{ matrix.target_rust }}/release/libguardian_agent.so
+
+  android-release-build:
+    needs: [resolve-tag, android-rust-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out agent-android
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - name: Check out agent-common
+        uses: actions/checkout@v5
+        with:
+          repository: Guardian-Parental-Controls/agent-common
+          ref: v1.0.0
+          path: _agent-common
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: tools platform-tools build-tools;35.0.0
+
+      - name: Download arm64 library
+        uses: actions/download-artifact@v4
+        with:
+          name: android-lib-arm64-v8a
+          path: app/src/main/jniLibs/arm64-v8a
+
+      - name: Download armeabi-v7a library
+        uses: actions/download-artifact@v4
+        with:
+          name: android-lib-armeabi-v7a
+          path: app/src/main/jniLibs/armeabi-v7a
+
+      - name: Download x86_64 library
+        uses: actions/download-artifact@v4
+        with:
+          name: android-lib-x86_64
+          path: app/src/main/jniLibs/x86_64
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate UniFFI Kotlin bindings
+        run: |
+          set -euo pipefail
+          cargo run --manifest-path _agent-common/Cargo.toml --bin uniffi-bindgen -- \
+            generate --language kotlin --library --no-format \
+            --out-dir app/src/main/java \
+            app/src/main/jniLibs/arm64-v8a/libguardian_agent.so
+
+      - name: Decode release keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANDROID_KEYSTORE_BASE64}" ]]; then
+            echo "ANDROID_KEYSTORE_BASE64 secret is required for signed release APKs." >&2
+            exit 1
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > release.keystore
+          if ! keytool -list -keystore release.keystore -storepass "$ANDROID_KEYSTORE_PASSWORD" >/dev/null 2>&1; then
+            echo "Failed to load release keystore; check ANDROID_KEYSTORE_* secrets." >&2
+            exit 1
+          fi
+
+      - name: Build release APK
+        env:
+          GUARDIAN_AGENT_VERSION: ${{ needs.resolve-tag.outputs.tag }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/release.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew clean assembleRelease --no-daemon
+
+      - name: Package release asset
+        env:
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          release_dir="app/build/outputs/apk/release"
+          metadata="${release_dir}/output-metadata.json"
+          if [[ ! -f "$metadata" ]]; then
+            echo "Missing ${metadata}" >&2
+            find "$release_dir" -type f -name '*.apk' -ls >&2 || true
+            exit 1
+          fi
+          output_file="$(python3 -c "import json, pathlib; print(json.loads(pathlib.Path('${metadata}').read_text())['elements'][0]['outputFile'])")"
+          if [[ "$output_file" == *unsigned* ]]; then
+            echo "Release build produced unsigned APK (${output_file}); check keystore secrets." >&2
+            exit 1
+          fi
+          apk_path="${release_dir}/${output_file}"
+          [[ -f "$apk_path" ]] || { echo "Signed release APK not found at ${apk_path}" >&2; exit 1; }
+          cp "$apk_path" "dist/guardian-android-agent-${TAG}.apk"
+          chmod +x scripts/android-signature-checksum.sh
+          checksum_file="dist/guardian-android-agent-${TAG}.signature-checksum"
+          ./scripts/android-signature-checksum.sh "dist/guardian-android-agent-${TAG}.apk" > "$checksum_file"
+          if [[ "$(tr -d '[:space:]' < "$checksum_file")" == "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU" ]]; then
+            echo "Refusing to publish the empty SHA-256 checksum." >&2
+            exit 1
+          fi
+
+      - name: Upload packaged asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: guardian-android-agent-apk
+          path: |
+            dist/guardian-android-agent-${{ needs.resolve-tag.outputs.tag }}.apk
+            dist/guardian-android-agent-${{ needs.resolve-tag.outputs.tag }}.signature-checksum
+
+  publish-release:
+    needs: [resolve-tag, android-release-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download android agent assets
+        uses: actions/download-artifact@v4
+        with:
+          name: guardian-android-agent-apk
+          path: dist
+
+      - name: Verify artifacts
+        env:
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          test -s "dist/guardian-android-agent-${TAG}.apk"
+          test -s "dist/guardian-android-agent-${TAG}.signature-checksum"
+          python3 - "$TAG" <<'PY'
+          import json
+          import pathlib
+          import sys
+          tag = sys.argv[1]
+          version = tag.lstrip("v")
+          checksum = pathlib.Path(f"dist/guardian-android-agent-{tag}.signature-checksum").read_text(encoding="utf-8").strip()
+          base = f"https://github.com/Guardian-Parental-Controls/agent-android/releases/download/{tag}"
+          payload = {
+              "event_type": "component-release",
+              "client_payload": {
+                  "component": "agent-android",
+                  "version": version,
+                  "repository": "https://github.com/Guardian-Parental-Controls/agent-android",
+                  "minimum_supported_version": "1.0.0",
+                  "min_server": "1.0.0",
+                  "protocol_version": 1,
+                  "artifacts": [
+                      {
+                          "id": "android-apk",
+                          "url": f"{base}/guardian-android-agent-{tag}.apk",
+                          "signature_checksum": checksum,
+                      }
+                  ],
+              },
+          }
+          pathlib.Path("/tmp/versions-dispatch.json").write_text(
+              json.dumps(payload, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
+          name: ${{ needs.resolve-tag.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true
+
+      - name: Create versions automation token
+        id: versions-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GUARDIAN_VERSIONS_APP_ID }}
+          private-key: ${{ secrets.GUARDIAN_VERSIONS_PRIVATE_KEY }}
+          owner: Guardian-Parental-Controls
+          repositories: versions
+
+      - name: Publish agent-android version
+        if: steps.versions-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.versions-token.outputs.token }}
+        run: |
+          gh api repos/Guardian-Parental-Controls/versions/dispatches \
+            --method POST \
+            --input /tmp/versions-dispatch.json

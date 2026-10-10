@@ -14,6 +14,8 @@ Kotlin/Android port of the Guardian Rust Linux client. See the [Android agent do
 
 Connectivity uses **FCM + short WebSocket sessions**, not a 24/7 socket. See the [Android agent docs](https://guardian-parental-controls.github.io/docs/latest/platforms/android-agent/).
 
+Tagged releases (`vX.Y.Z`) publish `guardian-android-agent-<tag>.apk` and a matching `.signature-checksum` via GitHub Actions. Signed APKs require the `ANDROID_KEYSTORE_*` repository secrets.
+
 ## Project layout
 
 - `protocol/` — WebSocket JSON messages and ephemeral `AgentWebSocketClient`
